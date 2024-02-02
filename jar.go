@@ -2,20 +2,26 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Package cookiejar implements an in-memory RFC 6265-compliant http.CookieJar.
+// Package cookiejar implements a persistent RFC 6265-compliant http.CookieJar.
 package cookiejar
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
+	"log"
 	"net"
 	"net/http"
-	"net/http/internal/ascii"
 	"net/url"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ypdn/cookiejar/internal/ascii"
 )
 
 // PublicSuffixList provides the public suffix of a domain. For example:
@@ -55,11 +61,24 @@ type Options struct {
 	// secure: it means that the HTTP server for foo.co.uk can set a cookie
 	// for bar.co.uk.
 	PublicSuffixList PublicSuffixList
+
+	// Directory to save the cookies. The zero value means that the Jar
+	// should not save cookies to (or read cookies from) the filesystem.
+	Directory string
+
+	// If not nil, ErrorLog will be used to log errors.
+	ErrorLog *log.Logger
 }
 
 // Jar implements the http.CookieJar interface from the net/http package.
 type Jar struct {
 	psList PublicSuffixList
+
+	// Cookie dir
+	dir string
+
+	// Error logger
+	errLog *log.Logger
 
 	// mu locks the remaining fields.
 	mu sync.Mutex
@@ -75,14 +94,91 @@ type Jar struct {
 
 // New returns a new cookie jar. A nil *Options is equivalent to a zero
 // Options.
-func New(o *Options) (*Jar, error) {
-	jar := &Jar{
-		entries: make(map[string]map[string]entry),
+func New(o *Options) (j *Jar, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = r.(error)
+		}
+	}()
+	j = new2(o)
+	return
+}
+
+func check(err error) {
+	if err != nil {
+		panic(err)
 	}
+}
+
+func must[T any](t T, err error) T {
+	check(err)
+	return t
+}
+
+func (j *Jar) rm(path string) {
+	err := os.Remove(path)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		j.errLog.Print(err)
+	}
+}
+
+func new2(o *Options) *Jar {
+	entries := make(map[string]map[string]entry)
+	jar := &Jar{entries: entries}
 	if o != nil {
 		jar.psList = o.PublicSuffixList
+		jar.dir = o.Directory
+		jar.errLog = o.ErrorLog
 	}
-	return jar, nil
+	if jar.dir == "" {
+		return jar
+	}
+	check(os.MkdirAll(jar.dir, 0700))
+	for _, key := range must(readdirnames(jar.dir)) {
+		ids := must(readdirnames(filepath.Join(jar.dir, key)))
+		if len(ids) == 0 {
+			continue
+		}
+		entries[key] = make(map[string]entry)
+		for _, id := range ids {
+			e := must(decode(filepath.Join(jar.dir, key, id)))
+			e.seqNum = jar.nextSeqNum
+			jar.nextSeqNum++
+			id = strings.Replace(id, "•", "/", -1)
+			entries[key][id] = *e
+		}
+	}
+	return jar
+}
+
+// decode reads the file specified by path and decodes it into a new entry.
+func decode(path string) (*entry, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var e entry
+	err = json.NewDecoder(f).Decode(&e)
+	if err != nil {
+		return nil, err
+	}
+	return &e, nil
+}
+
+func readdirnames(path string) ([]string, error) {
+	dir, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer dir.Close()
+
+	files, err := dir.Readdirnames(0)
+	if err != nil {
+		return nil, err
+	}
+	return files, nil
 }
 
 // entry is the internal representation of a cookie.
@@ -186,9 +282,15 @@ func (j *Jar) cookies(u *url.URL, now time.Time) (cookies []*http.Cookie) {
 	modified := false
 	var selected []entry
 	for id, e := range submap {
+		id2 := strings.Replace(id, "/", "•", -1)
+		fpath := filepath.Join(j.dir, key, id2)
+
 		if e.Persistent && !e.Expires.After(now) {
 			delete(submap, id)
 			modified = true
+			if j.dir != "" {
+				j.rm(fpath)
+			}
 			continue
 		}
 		if !e.shouldSend(https, host, path) {
@@ -202,6 +304,9 @@ func (j *Jar) cookies(u *url.URL, now time.Time) (cookies []*http.Cookie) {
 	if modified {
 		if len(submap) == 0 {
 			delete(j.entries, key)
+			if j.dir != "" {
+				j.rm(filepath.Join(j.dir, key))
+			}
 		} else {
 			j.entries[key] = submap
 		}
@@ -260,12 +365,18 @@ func (j *Jar) setCookies(u *url.URL, cookies []*http.Cookie, now time.Time) {
 			continue
 		}
 		id := e.id()
+		id2 := strings.Replace(id, "/", "•", -1)
+		fpath := filepath.Join(j.dir, key, id2)
+
 		if remove {
 			if submap != nil {
 				if _, ok := submap[id]; ok {
 					delete(submap, id)
 					modified = true
 				}
+			}
+			if j.dir != "" {
+				j.rm(fpath)
 			}
 			continue
 		}
@@ -284,11 +395,36 @@ func (j *Jar) setCookies(u *url.URL, cookies []*http.Cookie, now time.Time) {
 		e.LastAccess = now
 		submap[id] = e
 		modified = true
+
+		// save to the fs
+		if j.dir == "" {
+			continue
+		}
+		err = os.MkdirAll(filepath.Join(j.dir, key), 0700)
+		if err != nil {
+			j.errLog.Print(err)
+			continue
+		}
+		f, err := os.Create(fpath)
+		if err != nil {
+			j.errLog.Print(err)
+			continue
+		}
+		enc := json.NewEncoder(f)
+		enc.SetIndent("", "\t")
+		err = enc.Encode(e)
+		if err != nil {
+			j.errLog.Print(err)
+		}
+		f.Close()
 	}
 
 	if modified {
 		if len(submap) == 0 {
 			delete(j.entries, key)
+			if j.dir != "" {
+				j.rm(filepath.Join(j.dir, key))
+			}
 		} else {
 			j.entries[key] = submap
 		}
