@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net"
@@ -129,6 +130,9 @@ func new2(o *Options) *Jar {
 		jar.psList = o.PublicSuffixList
 		jar.dir = o.Directory
 		jar.errLog = o.ErrorLog
+	}
+	if jar.errLog == nil {
+		jar.errLog = log.New(io.Discard, "", 0)
 	}
 	if jar.dir == "" {
 		return jar
